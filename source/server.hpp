@@ -7,7 +7,9 @@
 #include <iostream>
 #include <ctime>
 #include <cstdarg>
+#include <sys/epoll.h>
 #include <fcntl.h>
+#include <functional>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -327,4 +329,68 @@ public:
         int flag = fcntl(_sockfd, F_GETFD, 0);
         fcntl(_sockfd, F_SETFD, flag | O_NONBLOCK);
     }
+};
+
+class Channel
+{
+    using EventCallback = std::function<void()>;
+
+public:
+    Channel(const int &fd) : _fd(fd), _events(0), _revents(0) {}
+    int Fd() { return _fd; }
+    void SetREvents(const uint32_t &events) { _revents = events; }
+    void SetReadCallback(const EventCallback &cb) { _read_callback = cb; }
+    void SetWriteCallback(const EventCallback &cb) { _write_callback = cb; }
+    void SetErrorCallback(const EventCallback &cb) { _error_callback = cb; }
+    void SetCloseCallback(const EventCallback &cb) { _close_callback = cb; }
+    void SetEventCallback(const EventCallback &cb) { _event_callback = cb; }
+    bool ReadAble() { return _events & EPOLLIN; }
+    bool WriteAble() { return _events & EPOLLOUT; }
+    void EnableRead() { _events |= EPOLLIN; }
+    void EnableWrite() { _events |= EPOLLOUT; }
+    void DisableRead() { _events &= ~EPOLLIN; }
+    void DisableWrite() { _events &= ~EPOLLOUT; }
+    void DisableAll() { _events = 0; }
+    void Remove();
+    void HandleEvent()
+    {
+        if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI))
+        {
+            if (_read_callback)
+                _read_callback();
+            if (_event_callback)
+                _event_callback();
+        }
+        if (_revents & EPOLLOUT)
+        {
+            if (_write_callback)
+                _write_callback();
+            if (_event_callback)
+                _event_callback();
+        }
+        else if (_revents & EPOLLERR)
+        {
+            if (_event_callback)
+                _event_callback();
+            if (_error_callback)
+                _error_callback();
+        }
+        else if (_revents & EPOLLHUP)
+        {
+            if (_event_callback)
+                _event_callback();
+            if (_close_callback)
+                _close_callback();
+        }
+    }
+
+private:
+    int _fd;
+    uint32_t _events;
+    uint32_t _revents;
+    EventCallback _read_callback;
+    EventCallback _write_callback;
+    EventCallback _error_callback;
+    EventCallback _close_callback;
+    EventCallback _event_callback;
 };
