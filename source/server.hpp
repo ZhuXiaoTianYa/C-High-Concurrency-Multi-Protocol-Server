@@ -4,6 +4,31 @@
 #include <string>
 #include <cstring>
 #include <iostream>
+#include <ctime>
+#include <cstdarg>
+
+#define DBG 0
+#define INF 1
+#define ERR 2
+#define FAT 3
+#define LOG_LEVEL DBG
+
+#define LOG(level, format, ...)                                                               \
+    do                                                                                        \
+    {                                                                                         \
+        if (level < LOG_LEVEL)                                                                \
+            break;                                                                            \
+        time_t t = time(NULL);                                                                \
+        struct tm *ltm = localtime(&t);                                                       \
+        char timer[32] = {0};                                                                 \
+        strftime(timer, 31, "%H:%M:%S", ltm);                                                 \
+        fprintf(stdout, "[%s %s:%d] " format "\n", timer, __FILE__, __LINE__, ##__VA_ARGS__); \
+    } while (0)
+
+#define DBG_LOG(format, ...) LOG(DBG, format, __VA_ARGS__)
+#define INF_LOG(format, ...) LOG(INF, format, __VA_ARGS__)
+#define ERR_LOG(format, ...) LOG(ERR, format, __VA_ARGS__)
+#define FAT_LOG(format, ...) LOG(FAT, format, __VA_ARGS__)
 
 #define BUFFER_DEFAULT_SIZE 1024
 class Buffer

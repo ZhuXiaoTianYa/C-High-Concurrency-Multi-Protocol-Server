@@ -12,7 +12,7 @@ int main()
     while (buf.ReadAbleSize() > 0)
     {
         std::string tmp = buf.GetLineAndMove();
-        std::cout << tmp;
+        DBG_LOG("%s", tmp.c_str());
     }
 
     // std::cout << buf.ReadAsStringAndMove(buf.ReadAbleSize());
