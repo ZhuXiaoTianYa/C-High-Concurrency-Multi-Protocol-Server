@@ -9,6 +9,9 @@
 #include <ctime>
 #include <cstdarg>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <mutex>
+#include <thread>
 #include <fcntl.h>
 #include <functional>
 #include <sys/socket.h>
@@ -456,7 +459,7 @@ public:
         {
             FAT_LOG("EPOLL CREATE FAILED");
             _epfd = -1;
-            return;
+            abort();
         }
     }
     void UpdateEvent(Channel *channel)
@@ -500,6 +503,119 @@ private:
     int _epfd;
     struct epoll_event _evs[MAX_EPOLLEVENTS];
     std::unordered_map<int, Channel *> _channels;
+};
+
+class EventLoop
+{
+    using Functor = std::function<void()>;
+
+private:
+    static int CreateEventFd()
+    {
+        int efd = eventfd(0, 0);
+        if (efd < 0)
+        {
+            FAT_LOG("EVENTFD FAILED!");
+            abort();
+        }
+        return efd;
+    }
+    void ReadEventFd()
+    {
+        uint64_t val;
+        ssize_t ret = read(_event_fd, &val, 8);
+        if (ret <= 0)
+        {
+            if (ret == EINTR || ret == EAGAIN)
+            {
+                return;
+            }
+            FAT_LOG("READ EVENTFA FAILED!");
+            abort();
+        }
+        return;
+    }
+    void WakeupEventFd()
+    {
+        uint64_t val = 1;
+        int ret = write(_event_fd, &val, 8);
+        if (ret < 0)
+        {
+            if (ret == EINTR)
+            {
+                return;
+            }
+            FAT_LOG("EVENTFD WRITE FAILED!");
+            abort();
+        }
+        return;
+    }
+    void RunAllTask()
+    {
+        std::vector<Functor> functor;
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            _tasks.swap(functor);
+        }
+        for (auto &task : functor)
+        {
+            task();
+        }
+        return;
+    }
+
+public:
+    EventLoop() : _event_fd(CreateEventFd()), _event_channel(new Channel(&_poller, _event_fd)), _thread_id(std::this_thread::get_id())
+    {
+        _event_channel->SetReadCallback(std::bind(&EventLoop::ReadEventFd, this));
+        _event_channel->EnableRead();
+    }
+    void RunInLoop(const Functor &cb)
+    {
+        if (InLoop())
+        {
+            return cb();
+        }
+        return QueueInLoop(cb);
+    }
+    void QueueInLoop(const Functor &cb)
+    {
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            _tasks.push_back(cb);
+        }
+        WakeupEventFd();
+    }
+    bool InLoop()
+    {
+        return (_thread_id == std::this_thread::get_id());
+    }
+    void UpdateEvent(Channel *channel)
+    {
+        channel->Update();
+    }
+    void RemoveEvent(Channel *channel)
+    {
+        channel->Remove();
+    }
+    void Start()
+    {
+        std::vector<Channel *> actives;
+        _poller.Poll(&actives);
+        for (auto &channel : actives)
+        {
+            channel->HandleEvent();
+        }
+        RunAllTask();
+    }
+
+private:
+    std::vector<Functor> _tasks;
+    Poller _poller;
+    int _event_fd;
+    std::unique_ptr<Channel *> _event_channel;
+    std::thread::id _thread_id;
+    std::mutex _mutex;
 };
 
 void Channel::Update() { _poller->UpdateEvent(this); }
