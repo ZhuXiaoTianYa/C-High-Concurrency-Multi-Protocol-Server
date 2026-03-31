@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <vector>
+#include <unordered_map>
 #include <stdint.h>
 #include <cassert>
 #include <string>
@@ -207,8 +208,7 @@ public:
     }
 
     bool Listen(const int &backlog = MAX_LISTEN)
-    {
-        // 相当于内核标记这个套接字为监听套接字
+    { // 相当于内核标记这个套接字为监听套接字
         // 内核的工作模式就变成了：
         // 内核自动接管三次握手
         // 自动维护一个半连接SYN队列和一个全连接Accept队列
@@ -331,13 +331,15 @@ public:
     }
 };
 
+class Poller;
 class Channel
 {
     using EventCallback = std::function<void()>;
 
 public:
-    Channel(const int &fd) : _fd(fd), _events(0), _revents(0) {}
+    Channel(Poller *poller, const int &fd) : _poller(poller), _fd(fd), _events(0), _revents(0) {}
     int Fd() { return _fd; }
+    uint32_t Events() { return _events; }
     void SetREvents(const uint32_t &events) { _revents = events; }
     void SetReadCallback(const EventCallback &cb) { _read_callback = cb; }
     void SetWriteCallback(const EventCallback &cb) { _write_callback = cb; }
@@ -346,11 +348,32 @@ public:
     void SetEventCallback(const EventCallback &cb) { _event_callback = cb; }
     bool ReadAble() { return _events & EPOLLIN; }
     bool WriteAble() { return _events & EPOLLOUT; }
-    void EnableRead() { _events |= EPOLLIN; }
-    void EnableWrite() { _events |= EPOLLOUT; }
-    void DisableRead() { _events &= ~EPOLLIN; }
-    void DisableWrite() { _events &= ~EPOLLOUT; }
-    void DisableAll() { _events = 0; }
+    void EnableRead()
+    {
+        _events |= EPOLLIN;
+        Update();
+    }
+    void EnableWrite()
+    {
+        _events |= EPOLLOUT;
+        Update();
+    }
+    void DisableRead()
+    {
+        _events &= ~EPOLLIN;
+        Update();
+    }
+    void DisableWrite()
+    {
+        _events &= ~EPOLLOUT;
+        Update();
+    }
+    void DisableAll()
+    {
+        _events = 0;
+        Update();
+    }
+    void Update();
     void Remove();
     void HandleEvent()
     {
@@ -386,6 +409,7 @@ public:
 
 private:
     int _fd;
+    Poller *_poller;
     uint32_t _events;
     uint32_t _revents;
     EventCallback _read_callback;
@@ -394,3 +418,89 @@ private:
     EventCallback _close_callback;
     EventCallback _event_callback;
 };
+
+#define MAX_EPOLLEVENTS 1024
+class Poller
+{
+private:
+    void Update(Channel *channel, const int &op)
+    {
+        int fd = channel->Fd();
+        struct epoll_event ev;
+        ev.data.fd = fd;
+        ev.events = channel->Events();
+        DBG_LOG("fd: %d, events: %d", fd, ev.events);
+        int ret = epoll_ctl(_epfd, op, fd, &ev);
+        if (ret < 0)
+        {
+            ERR_LOG("EPOLL CTL FAILED!");
+            return;
+        }
+        return;
+    }
+    bool HasChannel(Channel *channel)
+    {
+        auto it = _channels.find(channel->Fd());
+        if (it == _channels.end())
+        {
+            return false;
+        }
+        return true;
+    }
+
+public:
+    Poller() : _epfd(-1)
+    {
+        _epfd = epoll_create(1);
+        if (_epfd < 0)
+        {
+            FAT_LOG("EPOLL CREATE FAILED");
+            _epfd = -1;
+            return;
+        }
+    }
+    void UpdateEvent(Channel *channel)
+    {
+        if (HasChannel(channel) == false)
+        {
+            _channels.insert(std::make_pair(channel->Fd(), channel));
+            Update(channel, EPOLL_CTL_ADD);
+        }
+        Update(channel, EPOLL_CTL_MOD);
+    }
+    void RemoveEvent(Channel *channel)
+    {
+        auto it = _channels.find(channel->Fd());
+        if (it != _channels.end())
+        {
+            _channels.erase(it);
+        }
+        Update(channel, EPOLL_CTL_DEL);
+    }
+    void Poll(std::vector<Channel *> *active)
+    {
+        int nfds = epoll_wait(_epfd, _evs, MAX_EPOLLEVENTS, -1);
+        if (nfds < 0)
+        {
+            if (nfds == EINTR)
+                return;
+            ERR_LOG("EPOLL WAIT FAILED!");
+            abort();
+        }
+        for (int i = 0; i < nfds; i++)
+        {
+            auto it = _channels.find(_evs[i].data.fd);
+            assert(it != _channels.end());
+            it->second->SetREvents(_evs->events);
+            active->push_back(it->second);
+        }
+    }
+
+private:
+    int _epfd;
+    struct epoll_event _evs[MAX_EPOLLEVENTS];
+    std::unordered_map<int, Channel *> _channels;
+};
+
+void Channel::Update() { _poller->UpdateEvent(this); }
+void Channel::Remove() { _poller->RemoveEvent(this); }
