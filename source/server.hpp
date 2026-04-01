@@ -10,6 +10,7 @@
 #include <cstdarg>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <mutex>
 #include <thread>
 #include <fcntl.h>
@@ -17,6 +18,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <memory>
 
 #define DBG 0
 #define INF 1
@@ -303,13 +305,13 @@ public:
     {
         if (Create() == false)
             return false;
+        ReuseAddress();
         if (Bind(ip, port) == false)
             return false;
         if (Listen() == false)
             return false;
         if (block_flag == false)
             NonBlock();
-        ReuseAddress();
         return true;
     }
     bool CreateClient(const uint16_t &port, const std::string &ip)
@@ -335,12 +337,13 @@ public:
 };
 
 class Poller;
+class EventLoop;
 class Channel
 {
     using EventCallback = std::function<void()>;
 
 public:
-    Channel(Poller *poller, const int &fd) : _poller(poller), _fd(fd), _events(0), _revents(0) {}
+    Channel(EventLoop *loop, const int &fd) : _loop(loop), _fd(fd), _events(0), _revents(0) {}
     int Fd() { return _fd; }
     uint32_t Events() { return _events; }
     void SetREvents(const uint32_t &events) { _revents = events; }
@@ -412,7 +415,7 @@ public:
 
 private:
     int _fd;
-    Poller *_poller;
+    EventLoop *_loop;
     uint32_t _events;
     uint32_t _revents;
     EventCallback _read_callback;
@@ -432,7 +435,7 @@ private:
         struct epoll_event ev;
         ev.data.fd = fd;
         ev.events = channel->Events();
-        DBG_LOG("fd: %d, events: %d", fd, ev.events);
+        // DBG_LOG("fd: %d, events: %d", fd, ev.events);
         int ret = epoll_ctl(_epfd, op, fd, &ev);
         if (ret < 0)
         {
@@ -505,6 +508,155 @@ private:
     std::unordered_map<int, Channel *> _channels;
 };
 
+class EventLoop;
+using TaskFunc = std::function<void()>;
+using ReleaseFunc = std::function<void()>;
+class TimerTask
+{
+public:
+    TimerTask(const uint64_t &id, const uint32_t &timeout, const TaskFunc &cb) : _id(id), _timeout(timeout), _task_cb(cb), _canceled(false) {}
+    ~TimerTask()
+    {
+        if (_canceled == false)
+            _task_cb();
+        _release();
+    }
+    void Cancel()
+    {
+        _canceled = true;
+    }
+    void SetRelease(const ReleaseFunc &cb)
+    {
+        _release = cb;
+    }
+    uint32_t DelayTime()
+    {
+        return _timeout;
+    }
+
+private:
+    TaskFunc _task_cb;
+    ReleaseFunc _release;
+    bool _canceled;
+    uint64_t _id;
+    uint32_t _timeout;
+};
+
+class TimerWheel
+{
+    using PtrTask = std::shared_ptr<TimerTask>;
+    using WeakTask = std::weak_ptr<TimerTask>;
+
+private:
+    static int CreateTimerfd()
+    {
+        int timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+        if (timerfd < 0)
+        {
+            FAT_LOG("TIMERFD CREATE FAILED!");
+            abort();
+        }
+        struct itimerspec itime;
+        itime.it_value.tv_sec = 1;
+        itime.it_value.tv_nsec = 0;
+        itime.it_interval.tv_sec = 1;
+        itime.it_interval.tv_nsec = 0;
+        int ret = timerfd_settime(timerfd, 0, &itime, NULL);
+        if (ret < 0)
+        {
+            FAT_LOG("TIMERFD SETTIME FAILED!");
+            abort();
+        }
+        return timerfd;
+    }
+
+    void RunTimerTask()
+    {
+        _tick = (_tick + 1) % _capcity;
+        _wheel[_tick].clear();
+    }
+    void ReadTimerfd()
+    {
+        uint64_t val = 0;
+        int ret = read(_timerfd, &val, 8);
+        if (ret < 0)
+        {
+            // if(ret==EAGAIN||ret==EINTR)
+            //     return;
+            FAT_LOG("READ TIMERFD FAILED!");
+            abort();
+        }
+        return;
+    }
+    void OnTime()
+    {
+        ReadTimerfd();
+        RunTimerTask();
+    }
+    void TimerAddInLoop(const uint64_t &id, const uint32_t &delay, const TaskFunc &cb)
+    {
+        PtrTask pt(new TimerTask(id, delay, cb));
+        pt->SetRelease(std::bind(&TimerWheel::RemoveTimer, this, id));
+        _timers[id] = WeakTask(pt);
+        int pos = (_tick + delay) % _capcity;
+        _wheel[pos].push_back(pt);
+    }
+    void TimerRefreshInLoop(const uint64_t &id)
+    {
+        auto it = _timers.find(id);
+        if (it == _timers.end())
+            return;
+        PtrTask pt = it->second.lock();
+        int pos = (_tick + pt->DelayTime()) % _capcity;
+        _wheel[pos].push_back(pt);
+    }
+    void TimerCancelInLoop(const uint64_t &id)
+    {
+        auto it = _timers.find(id);
+        if (it == _timers.end())
+        {
+            return;
+        }
+        PtrTask pt = it->second.lock();
+        pt->Cancel();
+    }
+
+public:
+    TimerWheel(EventLoop *loop, const int &capcity = 60) : _tick(0), _capcity(capcity), _timerfd(CreateTimerfd()), _wheel(_capcity), _loop(loop), _timer_channel(new Channel(_loop, _timerfd))
+    {
+        _timer_channel->SetReadCallback(std::bind(&TimerWheel::OnTime, this));
+        _timer_channel->EnableRead();
+    }
+    void TimerAdd(const uint64_t &id, const uint32_t &delay, const TaskFunc &cb);
+    void TimerRefresh(const uint64_t &id);
+    void TimerCancel(const uint64_t &id);
+    // 存在线程安全问题，要保证只能在EventLoop中的线程中调用
+    bool HasTimer(const uint64_t &id)
+    {
+        auto it = _timers.find(id);
+        if (it == _timers.end())
+            return false;
+        return true;
+    }
+
+private:
+    void RemoveTimer(const uint64_t &id)
+    {
+        auto it = _timers.find(id);
+        if (it != _timers.end())
+            _timers.erase(it);
+    }
+
+private:
+    int _tick;
+    int _capcity;
+    int _timerfd;
+    EventLoop *_loop;
+    std::unique_ptr<Channel> _timer_channel;
+    std::vector<std::vector<PtrTask>> _wheel;
+    std::unordered_map<uint64_t, WeakTask> _timers;
+};
+
 class EventLoop
 {
     using Functor = std::function<void()>;
@@ -565,7 +717,7 @@ private:
     }
 
 public:
-    EventLoop() : _event_fd(CreateEventFd()), _event_channel(new Channel(&_poller, _event_fd)), _thread_id(std::this_thread::get_id())
+    EventLoop() : _event_fd(CreateEventFd()), _event_channel(new Channel(this, _event_fd)), _thread_id(std::this_thread::get_id()), _timer_wheel(this)
     {
         _event_channel->SetReadCallback(std::bind(&EventLoop::ReadEventFd, this));
         _event_channel->EnableRead();
@@ -592,11 +744,11 @@ public:
     }
     void UpdateEvent(Channel *channel)
     {
-        channel->Update();
+        _poller.UpdateEvent(channel);
     }
     void RemoveEvent(Channel *channel)
     {
-        channel->Remove();
+        _poller.RemoveEvent(channel);
     }
     void Start()
     {
@@ -608,15 +760,45 @@ public:
         }
         RunAllTask();
     }
+    void TimerAdd(const uint64_t &id, const uint32_t &delay, const TaskFunc &cb)
+    {
+        _timer_wheel.TimerAdd(id, delay, cb);
+    }
+    void TimerRefresh(const uint64_t &id)
+    {
+        _timer_wheel.TimerRefresh(id);
+    }
+    void TimerCancel(const uint64_t &id)
+    {
+        _timer_wheel.TimerCancel(id);
+    }
+    bool HasTimer(const uint64_t &id)
+    {
+        return _timer_wheel.HasTimer(id);
+    }
 
 private:
+    int _event_fd;
     std::vector<Functor> _tasks;
     Poller _poller;
-    int _event_fd;
-    std::unique_ptr<Channel *> _event_channel;
+    std::unique_ptr<Channel> _event_channel;
     std::thread::id _thread_id;
     std::mutex _mutex;
+    TimerWheel _timer_wheel;
 };
 
-void Channel::Update() { _poller->UpdateEvent(this); }
-void Channel::Remove() { _poller->RemoveEvent(this); }
+void Channel::Update() { _loop->UpdateEvent(this); }
+void Channel::Remove() { _loop->RemoveEvent(this); }
+
+void TimerWheel::TimerAdd(const uint64_t &id, const uint32_t &delay, const TaskFunc &cb)
+{
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerAddInLoop, this, id, delay, cb));
+}
+void TimerWheel::TimerRefresh(const uint64_t &id)
+{
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerRefreshInLoop, this, id));
+}
+void TimerWheel::TimerCancel(const uint64_t &id)
+{
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerCancelInLoop, this, id));
+}
