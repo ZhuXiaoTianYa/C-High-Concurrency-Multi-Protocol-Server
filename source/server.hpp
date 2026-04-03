@@ -12,6 +12,7 @@
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <mutex>
+#include <condition_variable>
 #include <any>
 #include <thread>
 #include <fcntl.h>
@@ -27,16 +28,16 @@
 #define FAT 3
 #define LOG_LEVEL DBG
 
-#define LOG(level, format, ...)                                                               \
-    do                                                                                        \
-    {                                                                                         \
-        if (level < LOG_LEVEL)                                                                \
-            break;                                                                            \
-        time_t t = time(NULL);                                                                \
-        struct tm *ltm = localtime(&t);                                                       \
-        char timer[32] = {0};                                                                 \
-        strftime(timer, 31, "%H:%M:%S", ltm);                                                 \
-        fprintf(stdout, "[%s %s:%d] " format "\n", timer, __FILE__, __LINE__, ##__VA_ARGS__); \
+#define LOG(level, format, ...)                                                                                          \
+    do                                                                                                                   \
+    {                                                                                                                    \
+        if (level < LOG_LEVEL)                                                                                           \
+            break;                                                                                                       \
+        time_t t = time(NULL);                                                                                           \
+        struct tm *ltm = localtime(&t);                                                                                  \
+        char timer[32] = {0};                                                                                            \
+        strftime(timer, 31, "%H:%M:%S", ltm);                                                                            \
+        fprintf(stdout, "[%p %s %s:%d] " format "\n", (void *)pthread_self(), timer, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 
 #define DBG_LOG(format, ...) LOG(DBG, format, ##__VA_ARGS__)
@@ -390,47 +391,31 @@ public:
     {
         if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI))
         {
-            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
-            DBG_LOG("end handle EVENT event");
-            DBG_LOG("start handle EPOLLIN event");
             if (_read_callback)
                 _read_callback();
-            DBG_LOG("end handle EPOLLIN event");
         }
         if (_revents & EPOLLOUT)
         {
-            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
-            DBG_LOG("end handle EVENT event");
-            DBG_LOG("start handle EPOLLOUT event");
             if (_write_callback)
                 _write_callback();
-            DBG_LOG("end handle EPOLLOUT event");
         }
         else if (_revents & EPOLLERR)
         {
-            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
-            DBG_LOG("end handle EVENT event");
-            DBG_LOG("start handle EPOLLERR event");
             if (_error_callback)
                 _error_callback();
-            DBG_LOG("end handle EPOLLERR event");
         }
         else if (_revents & EPOLLHUP)
         {
-            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
-            DBG_LOG("end handle EVENT event");
-            DBG_LOG("start handle EPOLLHUP event");
             if (_close_callback)
                 _close_callback();
-            DBG_LOG("end handle EPOLLHUP event");
         }
     }
 
@@ -514,13 +499,11 @@ public:
             ERR_LOG("EPOLL WAIT FAILED!");
             abort();
         }
-        DBG_LOG("----------------");
         for (int i = 0; i < nfds; i++)
         {
             auto it = _channels.find(_evs[i].data.fd);
             assert(it != _channels.end());
             it->second->SetREvents(_evs[i].events);
-            DBG_LOG("文件描述符:%d", _evs[i].data.fd);
             active->push_back(it->second);
         }
     }
@@ -540,14 +523,12 @@ public:
     TimerTask(const uint64_t &id, const uint32_t &timeout, const TaskFunc &cb) : _id(id), _timeout(timeout), _task_cb(cb), _canceled(false) {}
     ~TimerTask()
     {
-        DBG_LOG("~TimerTask: canceled=%d", _canceled);
         if (_canceled == false)
             _task_cb();
         _release();
     }
     void Cancel()
     {
-        DBG_LOG("Cancel executed");
         _canceled = true;
     }
     void SetRelease(const ReleaseFunc &cb)
@@ -779,16 +760,17 @@ public:
     }
     void Start()
     {
-        std::vector<Channel *> actives;
-        _poller.Poll(&actives);
-        for (auto &channel : actives)
+        while (true)
         {
-            int i = 1;
-            DBG_LOG("start handle event:%d", i);
-            channel->HandleEvent();
-            DBG_LOG("end handle event:%d", i++);
+            std::vector<Channel *> actives;
+            _poller.Poll(&actives);
+            for (auto &channel : actives)
+            {
+                int i = 1;
+                channel->HandleEvent();
+            }
+            RunAllTask();
         }
-        RunAllTask();
     }
     void TimerAdd(const uint64_t &id, const uint32_t &delay, const TaskFunc &cb)
     {
@@ -820,6 +802,43 @@ private:
     std::thread::id _thread_id;
     std::mutex _mutex;
     TimerWheel _timer_wheel;
+};
+
+class LoopThread
+{
+public:
+    LoopThread() : _loop(nullptr), _thread(&LoopThread::ThreadEntry, this)
+    {
+    }
+    EventLoop *GetLoop()
+    {
+        EventLoop *loop;
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            _cond.wait(lock, [&]()
+                       { return _loop != nullptr; });
+        }
+        loop = _loop;
+        return loop;
+    }
+
+private:
+    void ThreadEntry()
+    {
+        EventLoop loop;
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            _loop = &loop;
+            _cond.notify_all();
+        }
+        _loop->Start();
+    }
+
+private:
+    std::thread _thread;
+    EventLoop *_loop;
+    std::mutex _mutex;
+    std::condition_variable _cond;
 };
 
 enum class ConnStatus
@@ -889,7 +908,6 @@ private:
             _channel.DisableWrite();
             if (_status == ConnStatus::DISCONNECTING)
             {
-                DBG_LOG("1");
                 return ReleaseInLoop();
             }
         }
@@ -928,7 +946,6 @@ private:
     }
     void ReleaseInLoop()
     {
-        DBG_LOG("ReleaseInLoop called: %p", this);
         _status = ConnStatus::DISCONNECTED;
         _channel.Remove();
         _socket.Close();
