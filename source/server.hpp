@@ -12,6 +12,7 @@
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <mutex>
+#include <any>
 #include <thread>
 #include <fcntl.h>
 #include <functional>
@@ -91,6 +92,8 @@ public:
     }
     void Write(const void *data, const uint64_t &len)
     {
+        if (len == 0)
+            return;
         EnsureWriteSpace(len);
         const char *d = (const char *)data;
         std::copy(d, d + len, WritePosition());
@@ -277,6 +280,8 @@ public:
     }
     ssize_t Send(const void *buf, const size_t &len, const int &flag = 0)
     {
+        if (len == 0)
+            return 0;
         ssize_t ret = send(_sockfd, buf, len, flag);
         if (ret <= 0)
         {
@@ -385,31 +390,47 @@ public:
     {
         if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI))
         {
-            if (_read_callback)
-                _read_callback();
+            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
+            DBG_LOG("end handle EVENT event");
+            DBG_LOG("start handle EPOLLIN event");
+            if (_read_callback)
+                _read_callback();
+            DBG_LOG("end handle EPOLLIN event");
         }
         if (_revents & EPOLLOUT)
         {
-            if (_write_callback)
-                _write_callback();
+            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
+            DBG_LOG("end handle EVENT event");
+            DBG_LOG("start handle EPOLLOUT event");
+            if (_write_callback)
+                _write_callback();
+            DBG_LOG("end handle EPOLLOUT event");
         }
         else if (_revents & EPOLLERR)
         {
+            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
+            DBG_LOG("end handle EVENT event");
+            DBG_LOG("start handle EPOLLERR event");
             if (_error_callback)
                 _error_callback();
+            DBG_LOG("end handle EPOLLERR event");
         }
         else if (_revents & EPOLLHUP)
         {
+            DBG_LOG("start handle EVENT event");
             if (_event_callback)
                 _event_callback();
+            DBG_LOG("end handle EVENT event");
+            DBG_LOG("start handle EPOLLHUP event");
             if (_close_callback)
                 _close_callback();
+            DBG_LOG("end handle EPOLLHUP event");
         }
     }
 
@@ -493,11 +514,13 @@ public:
             ERR_LOG("EPOLL WAIT FAILED!");
             abort();
         }
+        DBG_LOG("----------------");
         for (int i = 0; i < nfds; i++)
         {
             auto it = _channels.find(_evs[i].data.fd);
             assert(it != _channels.end());
-            it->second->SetREvents(_evs->events);
+            it->second->SetREvents(_evs[i].events);
+            DBG_LOG("文件描述符:%d", _evs[i].data.fd);
             active->push_back(it->second);
         }
     }
@@ -517,12 +540,14 @@ public:
     TimerTask(const uint64_t &id, const uint32_t &timeout, const TaskFunc &cb) : _id(id), _timeout(timeout), _task_cb(cb), _canceled(false) {}
     ~TimerTask()
     {
+        DBG_LOG("~TimerTask: canceled=%d", _canceled);
         if (_canceled == false)
             _task_cb();
         _release();
     }
     void Cancel()
     {
+        DBG_LOG("Cancel executed");
         _canceled = true;
     }
     void SetRelease(const ReleaseFunc &cb)
@@ -618,7 +643,8 @@ private:
             return;
         }
         PtrTask pt = it->second.lock();
-        pt->Cancel();
+        if (pt)
+            pt->Cancel();
     }
 
 public:
@@ -633,6 +659,7 @@ public:
     // 存在线程安全问题，要保证只能在EventLoop中的线程中调用
     bool HasTimer(const uint64_t &id)
     {
+        // _loop->AssertInLoop();
         auto it = _timers.find(id);
         if (it == _timers.end())
             return false;
@@ -756,7 +783,10 @@ public:
         _poller.Poll(&actives);
         for (auto &channel : actives)
         {
+            int i = 1;
+            DBG_LOG("start handle event:%d", i);
             channel->HandleEvent();
+            DBG_LOG("end handle event:%d", i++);
         }
         RunAllTask();
     }
@@ -777,6 +807,11 @@ public:
         return _timer_wheel.HasTimer(id);
     }
 
+    void AssertInLoop()
+    {
+        assert(_thread_id == std::this_thread::get_id());
+    }
+
 private:
     int _event_fd;
     std::vector<Functor> _tasks;
@@ -785,6 +820,251 @@ private:
     std::thread::id _thread_id;
     std::mutex _mutex;
     TimerWheel _timer_wheel;
+};
+
+enum class ConnStatus
+{
+    DISCONNECTED,
+    CONNECTING,
+    CONNECTED,
+    DISCONNECTING
+};
+class Connection;
+using PtrConnection = std::shared_ptr<Connection>;
+class Connection : public std::enable_shared_from_this<Connection>
+{
+private:
+    uint64_t _conn_id;
+    // uint64_t _timer_id; // 用唯一的_conn_id做timer_id即可
+    int _sockfd;
+    EventLoop *_loop;
+    Socket _socket;
+    ConnStatus _status;
+    bool _enable_inactive_release;
+    Channel _channel;
+    Buffer _in_buffer;
+    Buffer _out_buffer;
+    std::any _context;
+
+    using ConnectedCallback = std::function<void(const PtrConnection &)>;
+    using MessageCallback = std::function<void(const PtrConnection &, Buffer *)>;
+    using CloseCallback = std::function<void(const PtrConnection &)>;
+    using AnyEventCallback = std::function<void(const PtrConnection &)>;
+
+    ConnectedCallback _connected_callback;
+    MessageCallback _message_callback;
+    CloseCallback _closed_callback;
+    AnyEventCallback _event_callback;
+    CloseCallback _server_closed_callback;
+
+private:
+    void HandleRead()
+    {
+        char buf[65536];
+        ssize_t ret = _socket.NonBlockRecv(buf, sizeof(buf) - 1);
+        if (ret < 0)
+        {
+            return ShutdownInLoop();
+        }
+        _in_buffer.WriteAndMove(buf, ret);
+        if (_in_buffer.ReadAbleSize() > 0)
+        {
+            return _message_callback(shared_from_this(), &_in_buffer);
+        }
+    }
+    void HandleWrite()
+    {
+        ssize_t ret = _socket.NonBlockSend(_out_buffer.ReadPosition(), _out_buffer.ReadAbleSize());
+        if (ret < 0)
+        {
+            if (_in_buffer.ReadAbleSize() > 0)
+            {
+                _message_callback(shared_from_this(), &_in_buffer);
+            }
+            return ReleaseInLoop();
+        }
+        _out_buffer.MoveReadOffset(ret);
+        if (_out_buffer.ReadAbleSize() == 0)
+        {
+            _channel.DisableWrite();
+            if (_status == ConnStatus::DISCONNECTING)
+            {
+                DBG_LOG("1");
+                return ReleaseInLoop();
+            }
+        }
+        return;
+    }
+    void HandleClose()
+    {
+        if (_in_buffer.ReadAbleSize() > 0)
+        {
+            _message_callback(shared_from_this(), &_in_buffer);
+        }
+        return ReleaseInLoop();
+    }
+    void HandleError()
+    {
+        HandleClose();
+    }
+    void HandleEvent()
+    {
+        if (_enable_inactive_release == true)
+        {
+            _loop->TimerRefresh(_conn_id);
+        }
+        if (_event_callback)
+        {
+            _event_callback(shared_from_this());
+        }
+    }
+    void EstablishedInLoop()
+    {
+        assert(_status == ConnStatus::CONNECTING);
+        _status = ConnStatus::CONNECTED;
+        _channel.EnableRead();
+        if (_connected_callback)
+            _connected_callback(shared_from_this());
+    }
+    void ReleaseInLoop()
+    {
+        DBG_LOG("ReleaseInLoop called: %p", this);
+        _status = ConnStatus::DISCONNECTED;
+        _channel.Remove();
+        _socket.Close();
+        if (_loop->HasTimer(_conn_id))
+            CancelInactiveReleaseInLoop();
+        if (_closed_callback)
+            _closed_callback(shared_from_this());
+        if (_server_closed_callback)
+            _server_closed_callback(shared_from_this());
+    }
+
+    void SendInLoop(const char *data, const size_t &len)
+    {
+        if (_status == ConnStatus::DISCONNECTED)
+        {
+            return;
+        }
+        _out_buffer.WriteAndMove(data, len);
+        if (_channel.WriteAble() == false)
+        {
+            _channel.EnableWrite();
+        }
+    }
+    // ?
+    void ShutdownInLoop()
+    {
+        _status = ConnStatus::DISCONNECTING;
+        if (_in_buffer.ReadAbleSize() > 0)
+        {
+            _message_callback(shared_from_this(), &_in_buffer);
+        }
+        if (_out_buffer.ReadAbleSize() > 0)
+        {
+            if (_channel.WriteAble() == false)
+            {
+                _channel.EnableWrite();
+            }
+        }
+        if (_out_buffer.ReadAbleSize() == 0)
+        {
+            ReleaseInLoop();
+        }
+    }
+    void EnableInactiveReleaseInLoop(const uint32_t &sec)
+    {
+        _enable_inactive_release = true;
+        if (_loop->HasTimer(_conn_id))
+        {
+            return _loop->TimerRefresh(_conn_id);
+        }
+        _loop->TimerAdd(_conn_id, sec, std::bind(&Connection::ReleaseInLoop, this));
+    }
+    void CancelInactiveReleaseInLoop()
+    {
+        _enable_inactive_release = false;
+        if (_loop->HasTimer(_conn_id))
+        {
+            _loop->TimerCancel(_conn_id);
+        }
+    }
+    void UpgradeInLoop(const std::any &context, const ConnectedCallback &conn_cb, const MessageCallback &msg_cb, const CloseCallback &close_cb, const AnyEventCallback &event_cb)
+    {
+        _context = context;
+        _connected_callback = conn_cb;
+        _message_callback = msg_cb;
+        _closed_callback = close_cb;
+        _event_callback = event_cb;
+    }
+
+public:
+    Connection(EventLoop *loop, const uint64_t &conn_id, const int &sockfd)
+        : _conn_id(conn_id), _sockfd(sockfd), _loop(loop), _socket(_sockfd), _status(ConnStatus::CONNECTING), _enable_inactive_release(false), _channel(_loop, _sockfd)
+    {
+        _channel.SetReadCallback(std::bind(&Connection::HandleRead, this));
+        _channel.SetWriteCallback(std::bind(&Connection::HandleWrite, this));
+        _channel.SetCloseCallback(std::bind(&Connection::HandleClose, this));
+        _channel.SetErrorCallback(std::bind(&Connection::HandleError, this));
+        _channel.SetEventCallback(std::bind(&Connection::HandleEvent, this));
+    }
+    ~Connection()
+    {
+        DBG_LOG("RELEASE CONNECTION:%p", this);
+    }
+    int Fd()
+    {
+        return _sockfd;
+    }
+    uint64_t Id()
+    {
+        return _conn_id;
+    }
+    bool Connected()
+    {
+        return _status == ConnStatus::CONNECTED;
+    }
+    void SetConnectedCallback(const ConnectedCallback &cb)
+    {
+        _connected_callback = cb;
+    }
+    void SetMessageCallback(const MessageCallback &cb)
+    {
+        _message_callback = cb;
+    }
+    void SetClosedCallback(const CloseCallback &cb)
+    {
+        _closed_callback = cb;
+    }
+    void SetAnyEventCallback(const AnyEventCallback &cb)
+    {
+        _event_callback = cb;
+    }
+    void Established()
+    {
+        _loop->RunInLoop(std::bind(&Connection::EstablishedInLoop, this));
+    }
+    void Send(const char *data, const size_t &len)
+    {
+        _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, data, len));
+    }
+    void Shutdown()
+    {
+        _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
+    }
+    void EnableInactiveRelease(const uint32_t &sec)
+    {
+        _loop->RunInLoop(std::bind(&Connection::EnableInactiveReleaseInLoop, this, sec));
+    }
+    void CancelInactiveRelease()
+    {
+        _loop->RunInLoop(std::bind(&Connection::CancelInactiveReleaseInLoop, this));
+    }
+    void Upgrade(const std::any &context, const ConnectedCallback &conn_cb, const MessageCallback &msg_cb, const CloseCallback &close_cb, const AnyEventCallback &event_cb)
+    {
+        _loop->AssertInLoop();
+        _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn_cb, msg_cb, close_cb, event_cb));
+    }
 };
 
 void Channel::Update() { _loop->UpdateEvent(this); }
