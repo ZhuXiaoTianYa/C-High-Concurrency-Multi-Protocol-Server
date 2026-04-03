@@ -940,13 +940,13 @@ private:
             _server_closed_callback(shared_from_this());
     }
 
-    void SendInLoop(const char *data, const size_t &len)
+    void SendInLoop(Buffer buf)
     {
         if (_status == ConnStatus::DISCONNECTED)
         {
             return;
         }
-        _out_buffer.WriteAndMove(data, len);
+        _out_buffer.WriteBufferAndMove(buf);
         if (_channel.WriteAble() == false)
         {
             _channel.EnableWrite();
@@ -1046,7 +1046,9 @@ public:
     }
     void Send(const char *data, const size_t &len)
     {
-        _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, data, len));
+        Buffer buf;
+        buf.WriteAndMove(data, len);
+        _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, buf));
     }
     void Shutdown()
     {
@@ -1064,6 +1066,48 @@ public:
     {
         _loop->AssertInLoop();
         _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn_cb, msg_cb, close_cb, event_cb));
+    }
+};
+
+class Acceptor
+{
+    using AcceptCallback = std::function<void(int)>;
+
+private:
+    Socket _socket;
+    EventLoop *_loop;
+    Channel _channel;
+    AcceptCallback _accept_callback;
+
+private:
+    void HandleRead()
+    {
+        int newfd = _socket.Accept();
+        if (newfd < 0)
+            return;
+        if (_accept_callback)
+            _accept_callback(newfd);
+    }
+    int CreateServer(const int &port)
+    {
+        bool ret = _socket.CreateServer(port);
+        assert(ret == true);
+        return _socket.Fd();
+    }
+
+public:
+    Acceptor(EventLoop *loop, const int &port)
+        : _socket(CreateServer(port)), _loop(loop), _channel(_loop, _socket.Fd())
+    {
+        _channel.SetReadCallback(std::bind(&Acceptor::HandleRead, this));
+    }
+    void SetAcceptCallback(const AcceptCallback &cb)
+    {
+        _accept_callback = cb;
+    }
+    void Listen()
+    {
+        _channel.EnableRead();
     }
 };
 
