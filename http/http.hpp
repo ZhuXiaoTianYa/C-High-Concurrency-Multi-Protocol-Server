@@ -1,6 +1,7 @@
 #ifndef __M_HTTP_H__
 #define __M_HTTP_H__
 #include "../source/server.hpp"
+#include <regex>
 #include <fstream>
 #include <sys/stat.h>
 
@@ -318,4 +319,91 @@ public:
         return it->second;
     }
 };
+
+class HttpRequest
+{
+private:
+    std::string _method;
+    std::string _path;
+    std::string _version;
+    std::string _body;
+    std::unordered_map<std::string, std::string> _headers;
+    std::unordered_map<std::string, std::string> _params;
+    std::smatch _matches;
+
+public:
+    void Reset()
+    {
+        _method.clear();
+        _path.clear();
+        _version.clear();
+        _body.clear();
+        _headers.clear();
+        _params.clear();
+        std::smatch matches;
+        matches.swap(_matches);
+    }
+    void SetHeader(const std::string &key, const std::string &val)
+    {
+        _headers.insert(std::make_pair(key, val));
+    }
+    bool HasHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+        {
+            return false;
+        }
+        return true;
+    }
+    std::string GetHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+        {
+            return "";
+        }
+        return it->second;
+    }
+    void SetParam(const std::string &key, const std::string &val)
+    {
+        _params.insert(std::make_pair(key, val));
+    }
+    bool HasParam(const std::string &key)
+    {
+        auto it = _params.find(key);
+        if (it == _params.end())
+        {
+            return false;
+        }
+        return true;
+    }
+    std::string GetParam(const std::string &key)
+    {
+        auto it = _params.find(key);
+        if (it == _params.end())
+        {
+            return "";
+        }
+        return it->second;
+    }
+    size_t ContentLength()
+    {
+        bool ret = HasHeader("Content-Length");
+        if (ret == false)
+        {
+            return 0;
+        }
+        std::string clen = GetHeader("Content-Length");
+        return std::stol(clen);
+    }
+    bool Close()
+    {
+        if (HasHeader("Connection") == true && (GetHeader("Connection") == "keep-alive" || GetHeader("Connection") == "Keep-Alive"))
+        {
+            return true;
+        }
+    }
+};
+
 #endif
