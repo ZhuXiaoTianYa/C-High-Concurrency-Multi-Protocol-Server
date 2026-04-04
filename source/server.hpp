@@ -1,3 +1,5 @@
+#ifndef __M_SERVER_H__
+#define __M_SERVER_H__
 #include <unistd.h>
 #include <vector>
 #include <unordered_map>
@@ -1304,3 +1306,5 @@ void TimerWheel::TimerCancel(const uint64_t &id)
 {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerCancelInLoop, this, id));
 }
+
+#endif
