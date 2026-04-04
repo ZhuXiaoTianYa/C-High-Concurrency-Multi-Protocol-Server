@@ -406,4 +406,66 @@ public:
     }
 };
 
+class HttpResponse
+{
+public:
+    HttpResponse() : _status(200), _redirect_flag(false) {}
+    HttpResponse(const int status) : _status(status), _redirect_flag(false) {}
+    void Reset()
+    {
+        _status = 200;
+        _redirect_flag = false;
+        _body.clear();
+        _redirect_url.clear();
+        _headers.clear();
+    }
+    void SetHeader(const std::string &key, const std::string &val)
+    {
+        _headers.insert(std::make_pair(key, val));
+    }
+    bool HasHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+        {
+            return false;
+        }
+        return true;
+    }
+    std::string GetHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+        {
+            return "";
+        }
+        return it->second;
+    }
+    void SetContent(const std::string &body, const std::string &type)
+    {
+        _body = body;
+        SetHeader("Content-Type", type);
+    }
+    void SetRedirect(const std::string &url, int status = 302)
+    {
+        _redirect_url = true;
+        _status = status;
+        _redirect_url = url;
+    }
+    bool Close()
+    {
+        if (HasHeader("Connection") == true && (GetHeader("Connection") == "keep-alive" || GetHeader("Connection") == "Keep-Alive"))
+        {
+            return true;
+        }
+    }
+
+private:
+    int _status;
+    bool _redirect_flag;
+    std::string _body;
+    std::string _redirect_url;
+    std::unordered_map<std::string, std::string> _headers;
+};
+
 #endif
