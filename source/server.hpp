@@ -1082,6 +1082,10 @@ public:
     {
         return _conn_id;
     }
+    void SetContext(const std::any &context)
+    {
+        _context = context;
+    }
     bool Connected()
     {
         return _status == ConnStatus::CONNECTED;
@@ -1133,6 +1137,10 @@ public:
     {
         _loop->AssertInLoop();
         _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn_cb, msg_cb, close_cb, event_cb));
+    }
+    std::any *GetContext()
+    {
+        return &_context;
     }
 };
 

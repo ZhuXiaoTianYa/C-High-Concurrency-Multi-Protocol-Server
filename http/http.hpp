@@ -347,7 +347,7 @@ public:
     {
         _headers.insert(std::make_pair(key, val));
     }
-    bool HasHeader(const std::string &key)
+    bool HasHeader(const std::string &key) const
     {
         auto it = _headers.find(key);
         if (it == _headers.end())
@@ -356,7 +356,7 @@ public:
         }
         return true;
     }
-    std::string GetHeader(const std::string &key)
+    std::string GetHeader(const std::string &key) const
     {
         auto it = _headers.find(key);
         if (it == _headers.end())
@@ -397,7 +397,7 @@ public:
         std::string clen = GetHeader("Content-Length");
         return std::stol(clen);
     }
-    bool Close()
+    bool Close() const
     {
         if (HasHeader("Connection") == true && (GetHeader("Connection") == "keep-alive" || GetHeader("Connection") == "Keep-Alive"))
         {
@@ -460,7 +460,7 @@ public:
         }
     }
 
-private:
+public:
     int _status;
     bool _redirect_flag;
     std::string _body;
@@ -507,6 +507,12 @@ public:
         }
         return;
     }
+    void Reset()
+    {
+        _resp_status = 200;
+        _recv_status = HttpRecvStatus::RECV_HTTP_LINE;
+        _request.Reset();
+    }
 
 private:
     bool RecvHttpLine(Buffer *buf)
@@ -541,7 +547,7 @@ private:
     bool ParseHttpLine(const std::string &line)
     {
         std::smatch matches;
-        std::regex e("(GET|POST|HEAD|PUT|DELETE) ([^?]*)(?:\\?(.*))? (HTTP/1\\.[01])(?:\n|\r\n)?");
+        std::regex e("(GET|POST|HEAD|PUT|DELETE) ([^?]*)(?:\\?(.*))? (HTTP/1\\.[01])(?:\n|\r\n)?", std::regex::icase);
         int ret = std::regex_match(line, matches, e);
         if (ret == false)
         {
@@ -550,6 +556,7 @@ private:
             return false;
         }
         _request._method = matches[1];
+        std::transform(_request._method.begin(), _request._method.end(), _request._method.begin(), ::toupper);
         _request._path = Util::UrlDecode(matches[2], false);
         _request._version = matches[4];
         std::vector<std::string> query_string_arry;
@@ -642,6 +649,211 @@ private:
     int _resp_status;
     HttpRecvStatus _recv_status;
     HttpRequest _request;
+};
+#define DEFAULT_TIMEOUT 30
+class HttpServer
+{
+    using Handler = std::function<void(const HttpRequest &, HttpResponse *)>;
+    using Handlers = std::vector<std::pair<std::regex, Handler>>;
+
+public:
+    HttpServer(const int port, const uint32_t timeout = DEFAULT_TIMEOUT)
+        : _server(port)
+    {
+        _server.SetConnectedCallback(std::bind(&HttpServer::OnConnected, this, std::placeholders::_1));
+        _server.SetMessageCallback(std::bind(&HttpServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
+        _server.EnableInactiveRelease(timeout);
+    }
+    void Get(const std::string &pattern, Handler &handler)
+    {
+        _get_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void Post(const std::string &pattern, Handler &handler)
+    {
+        _post_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void Put(const std::string &pattern, Handler &handler)
+    {
+        _put_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void Delete(const std::string &pattern, Handler &handler)
+    {
+        _delete_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void SetBaseDir(const std::string path)
+    {
+        _basedir = path;
+    }
+    void SetThreadCount(const int count)
+    {
+        _server.SetThreadCount(count);
+    }
+    void Listen()
+    {
+        _server.Start();
+    }
+
+private:
+    void OnConnected(const PtrConnection &conn)
+    {
+        conn->SetContext(HttpContext());
+        DBG_LOG("NEW CONNECTION %p", conn.get());
+    }
+    void OnMessage(const PtrConnection &conn, Buffer *buf)
+    {
+        while (buf->ReadAbleSize() > 0)
+        {
+            HttpContext *context = std::any_cast<HttpContext>(conn->GetContext());
+            context->RecvHttpRequest(buf);
+            HttpRequest &req = context->Request();
+            HttpResponse rsp(context->RespStatus());
+            if (context->RespStatus() >= 400)
+            {
+                ErrorHandler(req, &rsp);
+                WriteResponse(conn, req, &rsp);
+                conn->Shutdown();
+                return;
+            }
+            if (context->RecvStatus() != HttpRecvStatus::RECV_HTTP_OVER)
+            {
+                return;
+            }
+            Route(req, &rsp);
+            WriteResponse(conn, req, &rsp);
+            context->Reset();
+            if (rsp.Close() == true)
+            {
+                conn->Shutdown();
+                break;
+            }
+        }
+        return;
+    }
+    void Route(HttpRequest &req, HttpResponse *rsp)
+    {
+        if (IsFileHandler(req) == true)
+        {
+            return FileHandler(req, rsp);
+        }
+        if (req._method == "GET" && req._method == "HEAD")
+        {
+            return Dispatcher(req, rsp, _get_route);
+        }
+        else if (req._method == "POST")
+        {
+            return Dispatcher(req, rsp, _post_route);
+        }
+        else if (req._method == "PUT")
+        {
+            return Dispatcher(req, rsp, _put_route);
+        }
+        else if (req._method == "DELETE")
+        {
+            return Dispatcher(req, rsp, _delete_route);
+        }
+        rsp->_status = 405;
+        return;
+    }
+    void Dispatcher(HttpRequest &req, HttpResponse *rsp, Handlers headers)
+    {
+        for (auto &handler : headers)
+        {
+            const std::regex &re = handler.first;
+            if (std::regex_match(req._path, req._matches, re) == false)
+            {
+                continue;
+            }
+            return handler.second(req, rsp);
+        }
+        rsp->_status = 404;
+        return;
+    }
+    void ErrorHandler(const HttpRequest &req, HttpResponse *rsp)
+    {
+        std::string body = "<!DOCTYPEhtml><html><head><metahttp-equiv=\"Content-Type\"content=\"text/html;charset=utf-8\"><title>简单页面</title></head><body><h1>这是我用h1显示的一段话</h1></body></html>";
+        rsp->SetContent(body, "text/html");
+    }
+    void WriteResponse(const PtrConnection &conn, const HttpRequest &req, HttpResponse *rsp)
+    {
+        if (req.Close() == true)
+        {
+            rsp->SetHeader("Connection", "close");
+        }
+        else if (req.Close() == false && rsp->HasHeader("Connection") == false)
+        {
+            rsp->SetHeader("Connection", "keep-alive");
+        }
+        if (rsp->_body.empty() == false && rsp->HasHeader("Content-Length") == false)
+        {
+            rsp->SetHeader("Content-Length", std::to_string(rsp->_body.size()));
+        }
+        if (rsp->_body.empty() == false && rsp->HasHeader("Content-Type") == false)
+        {
+            rsp->SetHeader("Content-Type", "application/octet-stream");
+        }
+        if (rsp->_redirect_flag == true)
+        {
+            rsp->SetHeader("Location", rsp->_redirect_url);
+        }
+        std::stringstream rsp_str;
+        rsp_str << req._version << " " << rsp->_status << " " << Util::StatusDesc(rsp->_status) << "\r\n";
+        for (auto &head : rsp->_headers)
+        {
+            rsp_str << head.first << ": " << head.second << "\r\n";
+        }
+        rsp_str << "\r\n";
+        rsp_str << rsp->_body;
+        conn->Send(rsp_str.str().c_str(), rsp_str.str().size());
+    }
+    bool IsFileHandler(HttpRequest &req)
+    {
+        if (_basedir.empty())
+        {
+            return false;
+        }
+        if (req._method != "GET" || req._method != "POST")
+        {
+            return false;
+        }
+        if (Util::ValidPath(req._path) == false)
+        {
+            return false;
+        }
+        std::string req_path = _basedir + req._path;
+        if (req_path.back() = '/')
+        {
+            req_path += "index.html";
+        }
+        if (Util::IsRegular(req_path) == false)
+        {
+            return false;
+        }
+        return true;
+    }
+    void FileHandler(const HttpRequest &req, HttpResponse *rsp)
+    {
+        std::string req_path = _basedir + req._path;
+        if (req_path.back() = '/')
+        {
+            req_path += "index.html";
+        }
+        bool ret = Util::ReadFile(req_path, &rsp->_body);
+        if (ret == false)
+        {
+            return;
+        }
+        std::string mime = Util::ExtMime(req._path);
+        rsp->SetHeader("Content-Type", mime);
+        return;
+    }
+
+private:
+    Handlers _get_route;
+    Handlers _post_route;
+    Handlers _put_route;
+    Handlers _delete_route;
+    std::string _basedir;
+    TcpServer _server;
 };
 
 #endif
