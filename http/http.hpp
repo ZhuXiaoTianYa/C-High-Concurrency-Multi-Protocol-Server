@@ -322,7 +322,7 @@ public:
 
 class HttpRequest
 {
-private:
+public:
     std::string _method;
     std::string _path;
     std::string _version;
@@ -466,6 +466,182 @@ private:
     std::string _body;
     std::string _redirect_url;
     std::unordered_map<std::string, std::string> _headers;
+};
+
+enum class HttpRecvStatus
+{
+    RECV_HTTP_LINE,
+    RECV_HTTP_HEAD,
+    RECV_HTTP_BODY,
+    RECV_HTTP_OVER,
+    RECV_HTTP_ERROR
+};
+
+#define MAX_LINE 8192
+class HttpContext
+{
+public:
+    HttpContext() : _resp_status(200), _recv_status(HttpRecvStatus::RECV_HTTP_LINE) {}
+    int RespStatus()
+    {
+        return _resp_status;
+    }
+    HttpRequest &Request()
+    {
+        return _request;
+    }
+    HttpRecvStatus RecvStatus()
+    {
+        return _recv_status;
+    }
+    void RecvHttpRequest(Buffer *buf)
+    {
+        switch (_recv_status)
+        {
+        case HttpRecvStatus::RECV_HTTP_LINE:
+            RecvHttpLine(buf);
+        case HttpRecvStatus::RECV_HTTP_HEAD:
+            RecvHttpHead(buf);
+        case HttpRecvStatus::RECV_HTTP_BODY:
+            RecvHttpBody(buf);
+        }
+        return;
+    }
+
+private:
+    bool RecvHttpLine(Buffer *buf)
+    {
+        if (_recv_status != HttpRecvStatus::RECV_HTTP_LINE)
+            return false;
+        std::string line = buf->GetLineAndMove();
+        if (line.size() == 0)
+        {
+            if (buf->ReadAbleSize() > MAX_LINE)
+            {
+                _recv_status = HttpRecvStatus::RECV_HTTP_ERROR;
+                _resp_status = 414;
+                return false;
+            }
+            return false;
+        }
+        if (line.size() > MAX_LINE)
+        {
+            _resp_status = 414;
+            _recv_status = HttpRecvStatus::RECV_HTTP_ERROR;
+            return false;
+        }
+        bool ret = ParseHttpLine(line);
+        if (ret == false)
+        {
+            return false;
+        }
+        _recv_status = HttpRecvStatus::RECV_HTTP_HEAD;
+        return true;
+    }
+    bool ParseHttpLine(const std::string &line)
+    {
+        std::smatch matches;
+        std::regex e("(GET|POST|HEAD|PUT|DELETE) ([^?]*)(?:\\?(.*))? (HTTP/1\\.[01])(?:\n|\r\n)?");
+        int ret = std::regex_match(line, matches, e);
+        if (ret == false)
+        {
+            _resp_status = 400;
+            _recv_status = HttpRecvStatus::RECV_HTTP_ERROR;
+            return false;
+        }
+        _request._method = matches[1];
+        _request._path = Util::UrlDecode(matches[2], false);
+        _request._version = matches[4];
+        std::vector<std::string> query_string_arry;
+        Util::Split(matches[3], "&", &query_string_arry);
+        for (auto &str : query_string_arry)
+        {
+            size_t pos = str.find('=');
+            if (pos == std::string::npos)
+            {
+                _recv_status == HttpRecvStatus::RECV_HTTP_ERROR;
+                _resp_status = 400;
+                return false;
+            }
+            _request.SetParam(str.substr(0, pos), str.substr(pos + 1));
+        }
+        return true;
+    }
+    bool RecvHttpHead(Buffer *buf)
+    {
+        if (_recv_status != HttpRecvStatus::RECV_HTTP_HEAD)
+            return false;
+        while (true)
+        {
+            std::string line = buf->GetLineAndMove();
+            if (line.size() == 0)
+            {
+                if (buf->ReadAbleSize() > MAX_LINE)
+                {
+                    _recv_status = HttpRecvStatus::RECV_HTTP_ERROR;
+                    _resp_status = 414;
+                    return false;
+                }
+                return false;
+            }
+            if (line.size() > MAX_LINE)
+            {
+                _resp_status = 414;
+                _recv_status = HttpRecvStatus::RECV_HTTP_ERROR;
+                return false;
+            }
+            if (line == "\n" || line == "\r\n")
+            {
+                break;
+            }
+            bool ret = ParseHttpHead(line);
+            if (ret == false)
+            {
+                return false;
+            }
+        }
+        _recv_status = HttpRecvStatus::RECV_HTTP_BODY;
+        return true;
+    }
+    bool ParseHttpHead(const std::string &line)
+    {
+        size_t pos = line.find(": ");
+        if (pos == std::string::npos)
+        {
+            _recv_status = HttpRecvStatus::RECV_HTTP_ERROR;
+            _resp_status = 400;
+            return false;
+        }
+        _request.SetHeader(line.substr(0, pos), line.substr(pos + 2));
+        return true;
+    }
+    bool RecvHttpBody(Buffer *buf)
+    {
+        if (_recv_status != HttpRecvStatus::RECV_HTTP_BODY)
+            return false;
+        size_t content_length = _request.ContentLength();
+        if (content_length == 0)
+        {
+            _recv_status = HttpRecvStatus::RECV_HTTP_OVER;
+            return true;
+        }
+        size_t real_len = content_length - _request._body.size();
+        if (real_len <= buf->ReadAbleSize())
+        {
+            _request._body.append(buf->ReadPosition(), real_len);
+            buf->MoveReadOffset(real_len);
+            _recv_status = HttpRecvStatus::RECV_HTTP_OVER;
+            return true;
+        }
+        _request._body.append(buf->ReadPosition(), buf->ReadAbleSize());
+        buf->MoveReadOffset(buf->ReadAbleSize());
+        return true;
+    }
+
+private:
+    int _resp_status;
+    HttpRecvStatus _recv_status;
+    HttpRequest _request;
 };
 
 #endif
