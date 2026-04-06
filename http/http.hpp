@@ -401,8 +401,9 @@ public:
     {
         if (HasHeader("Connection") == true && (GetHeader("Connection") == "keep-alive" || GetHeader("Connection") == "Keep-Alive"))
         {
-            return true;
+            return false;
         }
+        return true;
     }
 };
 
@@ -456,8 +457,9 @@ public:
     {
         if (HasHeader("Connection") == true && (GetHeader("Connection") == "keep-alive" || GetHeader("Connection") == "Keep-Alive"))
         {
-            return true;
+            return false;
         }
+        return true;
     }
 
 public:
@@ -610,8 +612,12 @@ private:
         _recv_status = HttpRecvStatus::RECV_HTTP_BODY;
         return true;
     }
-    bool ParseHttpHead(const std::string &line)
+    bool ParseHttpHead(std::string &line)
     {
+        if (line.back() == '\n')
+            line.pop_back();
+        if (line.back() == '\r')
+            line.pop_back();
         size_t pos = line.find(": ");
         if (pos == std::string::npos)
         {
@@ -650,7 +656,7 @@ private:
     HttpRecvStatus _recv_status;
     HttpRequest _request;
 };
-#define DEFAULT_TIMEOUT 30
+#define DEFAULT_TIMEOUT 10
 class HttpServer
 {
     using Handler = std::function<void(const HttpRequest &, HttpResponse *)>;
@@ -664,24 +670,25 @@ public:
         _server.SetMessageCallback(std::bind(&HttpServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
         _server.EnableInactiveRelease(timeout);
     }
-    void Get(const std::string &pattern, Handler &handler)
+    void Get(const std::string &pattern, const Handler &handler)
     {
         _get_route.push_back(std::make_pair(std::regex(pattern), handler));
     }
-    void Post(const std::string &pattern, Handler &handler)
+    void Post(const std::string &pattern, const Handler &handler)
     {
         _post_route.push_back(std::make_pair(std::regex(pattern), handler));
     }
-    void Put(const std::string &pattern, Handler &handler)
+    void Put(const std::string &pattern, const Handler &handler)
     {
         _put_route.push_back(std::make_pair(std::regex(pattern), handler));
     }
-    void Delete(const std::string &pattern, Handler &handler)
+    void Delete(const std::string &pattern, const Handler &handler)
     {
         _delete_route.push_back(std::make_pair(std::regex(pattern), handler));
     }
     void SetBaseDir(const std::string path)
     {
+        assert(Util::IsDirectory(path) == true);
         _basedir = path;
     }
     void SetThreadCount(const int count)
@@ -711,6 +718,8 @@ private:
             {
                 ErrorHandler(req, &rsp);
                 WriteResponse(conn, req, &rsp);
+                buf->MoveReadOffset(buf->ReadAbleSize());
+                context->Reset();
                 conn->Shutdown();
                 return;
             }
@@ -735,7 +744,7 @@ private:
         {
             return FileHandler(req, rsp);
         }
-        if (req._method == "GET" && req._method == "HEAD")
+        if (req._method == "GET" || req._method == "HEAD")
         {
             return Dispatcher(req, rsp, _get_route);
         }
@@ -811,7 +820,7 @@ private:
         {
             return false;
         }
-        if (req._method != "GET" || req._method != "POST")
+        if (req._method != "GET" && req._method != "HEAD")
         {
             return false;
         }
@@ -842,7 +851,7 @@ private:
         {
             return;
         }
-        std::string mime = Util::ExtMime(req._path);
+        std::string mime = Util::ExtMime(req_path);
         rsp->SetHeader("Content-Type", mime);
         return;
     }

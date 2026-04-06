@@ -29,7 +29,7 @@
 #define INF 1
 #define ERR 2
 #define FAT 3
-#define LOG_LEVEL DBG
+#define LOG_LEVEL ERR
 
 #define LOG(level, format, ...)                                                                                          \
     do                                                                                                                   \
@@ -255,7 +255,6 @@ public:
 
     int Accept()
     {
-        // 相当于从全连接队列中拿出一个已经完成握手的客户端，然后创建一个全新的套接字给他
         int ret = accept(_sockfd, NULL, NULL);
         if (ret == -1)
         {
@@ -394,32 +393,26 @@ public:
     {
         if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI))
         {
-            if (_event_callback)
-                _event_callback();
             if (_read_callback)
                 _read_callback();
         }
         if (_revents & EPOLLOUT)
         {
-            if (_event_callback)
-                _event_callback();
             if (_write_callback)
                 _write_callback();
         }
         else if (_revents & EPOLLERR)
         {
-            if (_event_callback)
-                _event_callback();
             if (_error_callback)
                 _error_callback();
         }
         else if (_revents & EPOLLHUP)
         {
-            if (_event_callback)
-                _event_callback();
             if (_close_callback)
                 _close_callback();
         }
+        if (_event_callback)
+            _event_callback();
     }
 
 private:
@@ -527,7 +520,9 @@ public:
     ~TimerTask()
     {
         if (_canceled == false)
+        {
             _task_cb();
+        }
         _release();
     }
     void Cancel()
@@ -584,7 +579,7 @@ private:
         _tick = (_tick + 1) % _capcity;
         _wheel[_tick].clear();
     }
-    void ReadTimerfd()
+    uint64_t ReadTimerfd()
     {
         uint64_t val = 0;
         int ret = read(_timerfd, &val, 8);
@@ -595,12 +590,15 @@ private:
             FAT_LOG("READ TIMERFD FAILED!");
             abort();
         }
-        return;
+        return val;
     }
     void OnTime()
     {
-        ReadTimerfd();
-        RunTimerTask();
+        uint64_t count = ReadTimerfd();
+        for (int i = 0; i < count; i++)
+        {
+            RunTimerTask();
+        }
     }
     void TimerAddInLoop(const uint64_t &id, const uint32_t &delay, const TaskFunc &cb)
     {
@@ -655,7 +653,9 @@ private:
     {
         auto it = _timers.find(id);
         if (it != _timers.end())
+        {
             _timers.erase(it);
+        }
     }
 
 private:
@@ -945,7 +945,7 @@ private:
             {
                 _message_callback(shared_from_this(), &_in_buffer);
             }
-            return ReleaseInLoop();
+            return Release();
         }
         _out_buffer.MoveReadOffset(ret);
         if (_out_buffer.ReadAbleSize() == 0)
@@ -953,7 +953,7 @@ private:
             _channel.DisableWrite();
             if (_status == ConnStatus::DISCONNECTING)
             {
-                return ReleaseInLoop();
+                return Release();
             }
         }
         return;
@@ -964,7 +964,8 @@ private:
         {
             _message_callback(shared_from_this(), &_in_buffer);
         }
-        return ReleaseInLoop();
+
+        return Release();
     }
     void HandleError()
     {
@@ -1002,7 +1003,7 @@ private:
             _server_closed_callback(shared_from_this());
     }
 
-    void SendInLoop(Buffer buf)
+    void SendInLoop(Buffer &buf)
     {
         if (_status == ConnStatus::DISCONNECTED)
         {
@@ -1031,7 +1032,7 @@ private:
         }
         if (_out_buffer.ReadAbleSize() == 0)
         {
-            ReleaseInLoop();
+            Release();
         }
     }
     void EnableInactiveReleaseInLoop(const uint32_t &sec)
@@ -1041,7 +1042,7 @@ private:
         {
             return _loop->TimerRefresh(_conn_id);
         }
-        _loop->TimerAdd(_conn_id, sec, std::bind(&Connection::ReleaseInLoop, this));
+        _loop->TimerAdd(_conn_id, sec, std::bind(&Connection::Release, this));
     }
     void CancelInactiveReleaseInLoop()
     {
@@ -1119,11 +1120,15 @@ public:
     {
         Buffer buf;
         buf.WriteAndMove(data, len);
-        _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, buf));
+        _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, std::move(buf)));
     }
     void Shutdown()
     {
         _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
+    }
+    void Release()
+    {
+        _loop->QueueInLoop(std::bind(&Connection::ReleaseInLoop, this));
     }
     void EnableInactiveRelease(const uint32_t &sec)
     {
