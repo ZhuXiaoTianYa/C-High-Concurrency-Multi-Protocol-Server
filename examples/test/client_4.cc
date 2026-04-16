@@ -3,7 +3,7 @@
 int main()
 {
     std::string str = "GET /hello HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
-    for (int i = 0; i < 100; i++)
+    for (int i = 0; i < 500; i++)
     {
         pid_t pid = fork();
         if (pid < 0)

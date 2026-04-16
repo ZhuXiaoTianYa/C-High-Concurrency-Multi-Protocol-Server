@@ -1,5 +1,5 @@
 main:main.cc 
-	g++ -std=c++17 $^ -o $@
+	g++ -O2 -std=c++17 $^  -o  $@
 .PHONY:clean
 clean:
 	rm -f main

@@ -29,7 +29,8 @@
 #define INF 1
 #define ERR 2
 #define FAT 3
-#define LOG_LEVEL ERR
+#define NON 4
+#define LOG_LEVEL NON
 
 #define LOG(level, format, ...)                                                                                          \
     do                                                                                                                   \

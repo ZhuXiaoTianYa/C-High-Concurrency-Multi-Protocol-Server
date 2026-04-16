@@ -829,7 +829,7 @@ private:
             return false;
         }
         std::string req_path = _basedir + req._path;
-        if (req_path.back() = '/')
+        if (req_path.back() == '/')
         {
             req_path += "index.html";
         }
@@ -842,7 +842,7 @@ private:
     void FileHandler(const HttpRequest &req, HttpResponse *rsp)
     {
         std::string req_path = _basedir + req._path;
-        if (req_path.back() = '/')
+        if (req_path.back() == '/')
         {
             req_path += "index.html";
         }

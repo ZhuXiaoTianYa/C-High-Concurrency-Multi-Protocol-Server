@@ -19,6 +19,11 @@ std::string RequestStr(const HttpRequest &req)
     return rsp_str.str();
 }
 
+void Bench(const HttpRequest &req, HttpResponse *rsp)
+{
+    rsp->SetContent("OK", "text/plain");
+}
+
 void Hello(const HttpRequest &req, HttpResponse *rsp)
 {
     rsp->SetContent(RequestStr(req), "text/plain");
@@ -40,11 +45,12 @@ int main()
 {
     HttpServer server(8084);
     server.SetBaseDir(DEFAULT_BASE_DIR);
-    server.SetThreadCount(3);
-    server.Get("/hello", Hello);
-    server.Post("/login", Login);
-    server.Put("/123.txt", PutFile);
-    server.Delete("/123.txt", DelFile);
+    server.SetThreadCount(2);
+    //server.Get("/hello", Hello);
+    server.Get("/bench", Bench);
+    //server.Post("/login", Login);
+    //server.Put("/123.txt", PutFile);
+    //server.Delete("/123.txt", DelFile);
     server.Listen();
     return 0;
 }

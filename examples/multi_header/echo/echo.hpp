@@ -1,5 +1,5 @@
 #pragma once
-#include "../source/server.hpp"
+#include "../../../include/server/server.hpp"
 
 class EchoServer
 {
@@ -13,8 +13,6 @@ private:
 
         conn->Send(buf->ReadPosition(), buf->ReadAbleSize());
         buf->MoveReadOffset(buf->ReadAbleSize());
-        // sleep(8);
-        conn->Shutdown();
     }
     void OnClose(const PtrConnection &conn)
     {
